@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATA_ROOT="${1:-/path/to/imagenet}"
+DATA_ROOT="${1:-./data/imagenet1k_imagefolder}"
 OUTPUT_DIR="${2:-outputs}"
 DEVICE="${3:-cuda}"
 

@@ -22,13 +22,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-root",
         type=str,
-        required=True,
+        default="./data/imagenet1k_imagefolder",
         help="Output ImageFolder root, will create train/ and val/",
     )
     p.add_argument(
         "--cache-dir",
         type=str,
-        default="",
+        default="./data/hf_imagenet1k_raw/.cache",
         help="Datasets cache dir (optional)",
     )
     p.add_argument(
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--token",
         type=str,
         default="",
-        help="HF token (optional, fallback to HF_TOKEN env)",
+        help="HF token (optional, fallback to HF_TOKEN env or ./.hf_token)",
     )
     p.add_argument(
         "--image-format",
@@ -108,6 +108,10 @@ def main() -> None:
     os.environ["HF_ENDPOINT"] = args.endpoint
 
     token = args.token or os.environ.get("HF_TOKEN")
+    if not token:
+        token_file = Path("./.hf_token")
+        if token_file.exists():
+            token = token_file.read_text(encoding="utf-8").strip()
     output_root = Path(args.output_root).expanduser().resolve()
     train_dir = output_root / "train"
     val_dir = output_root / "val"

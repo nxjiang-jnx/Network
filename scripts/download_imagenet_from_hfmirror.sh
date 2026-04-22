@@ -2,18 +2,16 @@
 set -euo pipefail
 
 # Usage:
-#   bash scripts/download_imagenet_from_hfmirror.sh \
-#     /path/to/hf_raw \
-#     https://hf-mirror.com \
-#     /path/to/hf_token.txt
+#   echo "hf_xxx" > .hf_token
+#   bash scripts/download_imagenet_from_hfmirror.sh
 #
 # Notes:
 # - You must first accept the dataset terms on the website for ILSVRC/imagenet-1k.
 # - token file should contain plain token text on one line.
 
-RAW_DIR="${1:-$HOME/datasets/hf_imagenet1k_raw}"
+RAW_DIR="${1:-./data/hf_imagenet1k_raw}"
 HF_ENDPOINT_VALUE="${2:-https://hf-mirror.com}"
-TOKEN_FILE="${3:-}"
+TOKEN_FILE="${3:-./.hf_token}"
 CACHE_DIR="${RAW_DIR}/.cache"
 export RAW_DIR
 export CACHE_DIR
@@ -26,7 +24,7 @@ if [[ -n "${TOKEN_FILE}" && -f "${TOKEN_FILE}" ]]; then
 elif [[ -n "${HF_TOKEN:-}" ]]; then
   echo "Using HF_TOKEN from environment."
 else
-  echo "No token found. Set HF_TOKEN or provide token file path."
+  echo "No token found. Set HF_TOKEN or create ./.hf_token."
   exit 1
 fi
 
