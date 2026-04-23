@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 # Must run before torch initializes CUDA.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4,3,5,6")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3")
 
 import torch
 import torch.distributed as dist
