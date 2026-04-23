@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
 
 
@@ -16,6 +16,8 @@ def build_imagenet_loaders(
     train_crop_size: int = 224,
     val_resize_size: int = 256,
     val_crop_size: int = 224,
+    train_sampler: Optional[DistributedSampler] = None,
+    val_sampler: Optional[DistributedSampler] = None,
 ) -> Tuple[DataLoader, DataLoader]:
     root = Path(data_root)
     train_dir = root / "train"
@@ -53,7 +55,8 @@ def build_imagenet_loaders(
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=workers,
         pin_memory=True,
         drop_last=True,
@@ -63,6 +66,7 @@ def build_imagenet_loaders(
         val_ds,
         batch_size=val_batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=workers,
         pin_memory=True,
         drop_last=False,
