@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 # Must run before torch initializes CUDA.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,3,5,6")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4,3,5,6")
 
 import torch
 import torch.distributed as dist
@@ -82,6 +82,11 @@ def load_state_dict(model: nn.Module, state: dict) -> None:
         model.module.load_state_dict(state)
     else:
         model.load_state_dict(state)
+
+
+def eval_model_for_inference(model: nn.Module) -> nn.Module:
+    """DDP requires all ranks to participate in forward; rank-0-only val must use .module."""
+    return model.module if isinstance(model, DDP) else model
 
 
 def train_one_epoch(
@@ -257,7 +262,12 @@ def main() -> None:
         if distributed:
             dist.barrier()
             if rank == 0:
-                val_stats = evaluate(model=model, loader=val_loader, criterion=criterion, device=device)
+                val_stats = evaluate(
+                    model=eval_model_for_inference(model),
+                    loader=val_loader,
+                    criterion=criterion,
+                    device=device,
+                )
             else:
                 val_stats = {"loss": 0.0, "top1": 0.0, "top5": 0.0}
             dist.barrier()
