@@ -49,6 +49,31 @@ def parse_args() -> argparse.Namespace:
         help="Number of gradient accumulation steps.",
     )
     p.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable automatic mixed precision on CUDA.",
+    )
+    p.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["bf16", "fp16"],
+        default="bf16",
+        help="AMP compute dtype.",
+    )
+    p.add_argument(
+        "--channels-last",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use channels_last memory format for better convolution throughput.",
+    )
+    p.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TF32 matmul/cuDNN for speed on supported GPUs.",
+    )
+    p.add_argument(
         "--no-scale-lr",
         action="store_true",
         help="Disable linear LR scaling by world size (DDP default scales).",
@@ -105,6 +130,9 @@ def train_one_epoch(
     epoch: int,
     epochs: int,
     grad_accum_steps: int = 1,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    channels_last: bool = False,
 ) -> dict[str, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -118,6 +146,8 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
     for step_idx, (images, target) in enumerate(pbar, start=1):
         images = images.to(device, non_blocking=True)
+        if channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
         target = target.to(device, non_blocking=True)
 
         is_update_step = (step_idx % accum == 0) or (step_idx == num_batches)
@@ -128,8 +158,9 @@ def train_one_epoch(
             sync_ctx = model.no_sync()
 
         with sync_ctx:
-            output = model(images)
-            loss = criterion(output, target)
+            with torch.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                output = model(images)
+                loss = criterion(output, target)
             (loss / current_accum).backward()
 
         if is_update_step:
@@ -186,11 +217,17 @@ def evaluate(model: nn.Module, loader, criterion: nn.Module, device: torch.devic
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
     top5_meter = AverageMeter()
+    channels_last = getattr(model, "_use_channels_last", False)
+    amp_enabled = bool(getattr(model, "_amp_enabled", False))
+    amp_dtype = getattr(model, "_amp_dtype", torch.bfloat16)
     for images, target in tqdm(loader, desc="val", leave=False):
         images = images.to(device, non_blocking=True)
+        if channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
         target = target.to(device, non_blocking=True)
-        output = model(images)
-        loss = criterion(output, target)
+        with torch.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+            output = model(images)
+            loss = criterion(output, target)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         bs = images.size(0)
         loss_meter.update(float(loss.item()), bs)
@@ -211,6 +248,10 @@ def main() -> None:
         lr = args.lr
 
     set_seed(args.seed + rank)
+    torch.backends.cudnn.benchmark = True
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        torch.backends.cudnn.allow_tf32 = args.tf32
 
     output_dir = Path(args.output_dir) / args.model
     if rank == 0:
@@ -223,8 +264,18 @@ def main() -> None:
     history_path = output_dir / "history.jsonl"
 
     model = create_model(args).to(device)
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    model._use_channels_last = args.channels_last
+    model._amp_enabled = amp_enabled
+    model._amp_dtype = amp_dtype
     if distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model.module._use_channels_last = args.channels_last
+        model.module._amp_enabled = amp_enabled
+        model.module._amp_dtype = amp_dtype
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
     optimizer = torch.optim.SGD(
@@ -278,6 +329,9 @@ def main() -> None:
             epoch=epoch,
             epochs=args.epochs,
             grad_accum_steps=args.grad_accum_steps,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=args.channels_last,
         )
         train_stats = sync_train_stats(train_raw, device)
 
