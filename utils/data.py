@@ -18,7 +18,8 @@ def build_imagenet_loaders(
     val_crop_size: int = 224,
     train_sampler: Optional[DistributedSampler] = None,
     val_sampler: Optional[DistributedSampler] = None,
-) -> Tuple[DataLoader, DataLoader]:
+    build_val: bool = True,
+) -> Tuple[DataLoader, Optional[DataLoader]]:
     root = Path(data_root)
     train_dir = root / "train"
     val_dir = root / "val"
@@ -48,7 +49,6 @@ def build_imagenet_loaders(
     )
 
     train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
-    val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
 
     val_batch_size = val_batch_size or batch_size
 
@@ -62,6 +62,10 @@ def build_imagenet_loaders(
         drop_last=True,
         persistent_workers=workers > 0,
     )
+    if not build_val:
+        return train_loader, None
+
+    val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
     val_loader = DataLoader(
         val_ds,
         batch_size=val_batch_size,
@@ -73,6 +77,41 @@ def build_imagenet_loaders(
         persistent_workers=workers > 0,
     )
     return train_loader, val_loader
+
+
+def build_imagenet_val_loader(
+    data_root: str,
+    val_batch_size: int,
+    workers: int,
+    val_resize_size: int = 256,
+    val_crop_size: int = 224,
+) -> DataLoader:
+    root = Path(data_root)
+    val_dir = root / "val"
+    if not val_dir.exists():
+        raise FileNotFoundError(f"Validation folder not found: {val_dir}")
+
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
+    val_tf = transforms.Compose(
+        [
+            transforms.Resize(val_resize_size),
+            transforms.CenterCrop(val_crop_size),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
+    return DataLoader(
+        val_ds,
+        batch_size=val_batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=workers > 0,
+    )
 
 
 def device_from_flag(device: str) -> torch.device:

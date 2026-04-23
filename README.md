@@ -37,11 +37,13 @@ Expected ImageNet folder:
     ...
 ```
 
-Train both models:
+Train both models (default: 4-way DDP via `torchrun`, see `scripts/run_train_120e.sh`):
 
 ```bash
-bash scripts/run_train_120e.sh /path/to/imagenet outputs cuda
+bash scripts/run_train_120e.sh
 ```
+
+Single GPU: `NPROC=1 bash scripts/run_train_120e.sh`
 
 Run deletion study + acceleration:
 

@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
-from typing import Dict
+
+# Must run before torch initializes CUDA.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,3,5,6")
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
+from torchvision import datasets
 
 from models import build_resnet152, build_resnet152_stochastic_depth
 from utils.data import build_imagenet_loaders, device_from_flag
@@ -34,7 +41,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--save-every", type=int, default=1)
+    p.add_argument(
+        "--no-scale-lr",
+        action="store_true",
+        help="Disable linear LR scaling by world size (DDP default scales).",
+    )
     return p.parse_args()
+
+
+def setup_distributed() -> tuple[bool, int, int, int]:
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return True, rank, world_size, local_rank
+    return False, 0, 1, 0
 
 
 def set_seed(seed: int) -> None:
@@ -48,6 +71,19 @@ def create_model(args: argparse.Namespace) -> nn.Module:
     return build_resnet152_stochastic_depth(p_last=args.sd_p_last, num_classes=1000)
 
 
+def unwrap_state_dict(model: nn.Module) -> dict:
+    if isinstance(model, DDP):
+        return model.module.state_dict()
+    return model.state_dict()
+
+
+def load_state_dict(model: nn.Module, state: dict) -> None:
+    if isinstance(model, DDP):
+        model.module.load_state_dict(state)
+    else:
+        model.load_state_dict(state)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader,
@@ -56,13 +92,13 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     epochs: int,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     model.train()
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
     top5_meter = AverageMeter()
 
-    pbar = tqdm(loader, desc=f"train {epoch + 1}/{epochs}", leave=False)
+    pbar = tqdm(loader, desc=f"train {epoch + 1}/{epochs}", leave=False, disable=dist.is_initialized() and dist.get_rank() != 0)
     for images, target in pbar:
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
@@ -81,11 +117,45 @@ def train_one_epoch(
         top5_meter.update(float(acc5.item()), bs)
         pbar.set_postfix(loss=f"{loss_meter.avg:.4f}", top1=f"{top1_meter.avg:.2f}")
 
-    return {"loss": loss_meter.avg, "top1": top1_meter.avg, "top5": top5_meter.avg}
+    return {
+        "loss": loss_meter.avg,
+        "top1": top1_meter.avg,
+        "top5": top5_meter.avg,
+        "_loss_sum": loss_meter.sum,
+        "_loss_cnt": loss_meter.count,
+        "_top1_sum": top1_meter.sum,
+        "_top1_cnt": top1_meter.count,
+        "_top5_sum": top5_meter.sum,
+        "_top5_cnt": top5_meter.count,
+    }
+
+
+def sync_train_stats(stats: dict[str, float], device: torch.device) -> dict[str, float]:
+    if not dist.is_initialized():
+        return {k: v for k, v in stats.items() if not k.startswith("_")}
+    t = torch.tensor(
+        [
+            stats["_loss_sum"],
+            stats["_loss_cnt"],
+            stats["_top1_sum"],
+            stats["_top1_cnt"],
+            stats["_top5_sum"],
+            stats["_top5_cnt"],
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    ls, lc, u1, c1, u5, c5 = t.tolist()
+    return {
+        "loss": float(ls / max(lc, 1)),
+        "top1": float(u1 / max(c1, 1)),
+        "top5": float(u5 / max(c5, 1)),
+    }
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, criterion: nn.Module, device: torch.device) -> Dict[str, float]:
+def evaluate(model: nn.Module, loader, criterion: nn.Module, device: torch.device) -> dict[str, float]:
     model.eval()
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
@@ -105,19 +175,34 @@ def evaluate(model: nn.Module, loader, criterion: nn.Module, device: torch.devic
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
-    device = device_from_flag(args.device)
+    distributed, rank, world_size, local_rank = setup_distributed()
+
+    if distributed:
+        device = torch.device("cuda", local_rank)
+        lr = args.lr * world_size if not args.no_scale_lr else args.lr
+    else:
+        device = device_from_flag(args.device)
+        lr = args.lr
+
+    set_seed(args.seed + rank)
 
     output_dir = Path(args.output_dir) / args.model
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
+
     ckpt_last = output_dir / "last.pt"
     ckpt_best = output_dir / "best.pt"
     history_path = output_dir / "history.jsonl"
 
     model = create_model(args).to(device)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
     optimizer = torch.optim.SGD(
-        model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
+        model.parameters(), lr=lr, momentum=args.momentum, weight_decay=args.weight_decay
     )
 
     cosine = CosineAnnealingLR(optimizer, T_max=max(args.epochs - args.warmup_epochs, 1))
@@ -131,22 +216,34 @@ def main() -> None:
     resume_path = Path(args.resume) if args.resume else ckpt_last
     if resume_path.exists():
         state = torch.load(resume_path, map_location="cpu")
-        model.load_state_dict(state["model"])
+        load_state_dict(model, state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         start_epoch = int(state["epoch"]) + 1
         best_top1 = float(state.get("best_top1", 0.0))
-        print(f"Resumed from {resume_path}, start_epoch={start_epoch}")
+        if rank == 0:
+            print(f"Resumed from {resume_path}, start_epoch={start_epoch}")
+
+    train_sampler: DistributedSampler | None = None
+    if distributed:
+        train_ds = datasets.ImageFolder(str(Path(args.data_root) / "train"))
+        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
 
     train_loader, val_loader = build_imagenet_loaders(
         data_root=args.data_root,
         batch_size=args.batch_size,
         val_batch_size=args.val_batch_size,
         workers=args.workers,
+        train_sampler=train_sampler,
+        val_sampler=None,
+        build_val=not distributed or rank == 0,
     )
 
     for epoch in range(start_epoch, args.epochs):
-        train_stats = train_one_epoch(
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        train_raw = train_one_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
@@ -155,7 +252,18 @@ def main() -> None:
             epoch=epoch,
             epochs=args.epochs,
         )
-        val_stats = evaluate(model=model, loader=val_loader, criterion=criterion, device=device)
+        train_stats = sync_train_stats(train_raw, device)
+
+        if distributed:
+            dist.barrier()
+            if rank == 0:
+                val_stats = evaluate(model=model, loader=val_loader, criterion=criterion, device=device)
+            else:
+                val_stats = {"loss": 0.0, "top1": 0.0, "top5": 0.0}
+            dist.barrier()
+        else:
+            val_stats = evaluate(model=model, loader=val_loader, criterion=criterion, device=device)
+
         scheduler.step()
         cur_lr = optimizer.param_groups[0]["lr"]
 
@@ -166,31 +274,37 @@ def main() -> None:
             "val": val_stats,
             "val_error": 100.0 - val_stats["top1"],
         }
-        with history_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+        if rank == 0:
+            with history_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
 
-        is_best = val_stats["top1"] > best_top1
-        best_top1 = max(best_top1, val_stats["top1"])
-        save_state = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "best_top1": best_top1,
-            "args": vars(args),
-        }
-        if (epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs:
-            torch.save(save_state, ckpt_last)
-        if is_best:
-            torch.save(save_state, ckpt_best)
+            is_best = val_stats["top1"] > best_top1
+            best_top1 = max(best_top1, val_stats["top1"])
+            save_state = {
+                "epoch": epoch,
+                "model": unwrap_state_dict(model),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_top1": best_top1,
+                "args": vars(args),
+            }
+            if (epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs:
+                torch.save(save_state, ckpt_last)
+            if is_best:
+                torch.save(save_state, ckpt_best)
 
-        print(
-            f"epoch={epoch + 1} lr={cur_lr:.6f} "
-            f"train_top1={train_stats['top1']:.2f} val_top1={val_stats['top1']:.2f} "
-            f"best_top1={best_top1:.2f}"
-        )
+            print(
+                f"epoch={epoch + 1} lr={cur_lr:.6f} "
+                f"train_top1={train_stats['top1']:.2f} val_top1={val_stats['top1']:.2f} "
+                f"best_top1={best_top1:.2f}"
+            )
 
-    print(f"Training finished. Best val top1={best_top1:.2f}")
+    if rank == 0:
+        print(f"Training finished. Best val top1={best_top1:.2f}")
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

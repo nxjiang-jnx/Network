@@ -3,9 +3,13 @@ set -euo pipefail
 
 DATA_ROOT="${1:-./data/imagenet1k_imagefolder}"
 OUTPUT_DIR="${2:-outputs}"
-DEVICE="${3:-cuda}"
+NPROC="${NPROC:-4}"
+BASE_PORT="${MASTER_PORT:-29501}"
 
-python train_imagenet.py \
+export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+
+export MASTER_PORT="${BASE_PORT}"
+torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
   --data-root "${DATA_ROOT}" \
   --output-dir "${OUTPUT_DIR}" \
   --model resnet152 \
@@ -17,10 +21,10 @@ python train_imagenet.py \
   --momentum 0.9 \
   --weight-decay 1e-4 \
   --label-smoothing 0.1 \
-  --warmup-epochs 5 \
-  --device "${DEVICE}"
+  --warmup-epochs 5
 
-python train_imagenet.py \
+export MASTER_PORT=$((BASE_PORT + 1))
+torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
   --data-root "${DATA_ROOT}" \
   --output-dir "${OUTPUT_DIR}" \
   --model resnet152_sd \
@@ -33,5 +37,4 @@ python train_imagenet.py \
   --momentum 0.9 \
   --weight-decay 1e-4 \
   --label-smoothing 0.1 \
-  --warmup-epochs 5 \
-  --device "${DEVICE}"
+  --warmup-epochs 5
