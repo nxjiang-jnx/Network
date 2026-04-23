@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--save-every", type=int, default=1)
+    p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps.",
+    )
     p.add_argument(
         "--no-scale-lr",
         action="store_true",
@@ -97,23 +104,37 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     epochs: int,
+    grad_accum_steps: int = 1,
 ) -> dict[str, float]:
     model.train()
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
     top5_meter = AverageMeter()
+    accum = max(int(grad_accum_steps), 1)
+    num_batches = len(loader)
+    remainder = num_batches % accum
 
     pbar = tqdm(loader, desc=f"train {epoch + 1}/{epochs}", leave=False, disable=dist.is_initialized() and dist.get_rank() != 0)
-    for images, target in pbar:
+    optimizer.zero_grad(set_to_none=True)
+    for step_idx, (images, target) in enumerate(pbar, start=1):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        output = model(images)
-        loss = criterion(output, target)
+        is_update_step = (step_idx % accum == 0) or (step_idx == num_batches)
+        current_accum = remainder if (step_idx == num_batches and remainder != 0) else accum
 
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        sync_ctx = nullcontext()
+        if isinstance(model, DDP) and not is_update_step:
+            sync_ctx = model.no_sync()
+
+        with sync_ctx:
+            output = model(images)
+            loss = criterion(output, target)
+            (loss / current_accum).backward()
+
+        if is_update_step:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         bs = images.size(0)
@@ -256,6 +277,7 @@ def main() -> None:
             device=device,
             epoch=epoch,
             epochs=args.epochs,
+            grad_accum_steps=args.grad_accum_steps,
         )
         train_stats = sync_train_stats(train_raw, device)
 
