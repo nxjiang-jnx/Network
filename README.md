@@ -70,7 +70,7 @@ Main outputs:
 - During eval, residual output is expectation-scaled by `p_l`.
 - Tail truncation is implemented by `set_active_block_count`.
 
-## Citation basis
+## Thanks
 
 - ResNet: He et al., "Deep Residual Learning for Image Recognition", 2015.
 - Stochastic Depth: Huang et al., "Deep Networks with Stochastic Depth", 2016.
