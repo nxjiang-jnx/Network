@@ -8,6 +8,7 @@ from pathlib import Path
 
 # Must run before torch initializes CUDA.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.distributed as dist
@@ -19,8 +20,10 @@ from tqdm import tqdm
 from torchvision import datasets
 
 from models import build_resnet152, build_resnet152_stochastic_depth
-from utils.data import build_imagenet_loaders, device_from_flag
+from utils.data import build_imagenet_loaders
 from utils.metrics import AverageMeter, accuracy
+
+AMP_DTYPE = torch.bfloat16
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,55 +32,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=str, default="outputs")
     p.add_argument("--model", type=str, choices=["resnet152", "resnet152_sd"], required=True)
     p.add_argument("--epochs", type=int, default=120)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=112)
     p.add_argument("--val-batch-size", type=int, default=256)
-    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--workers", type=int, default=12)
+    p.add_argument("--prefetch-factor", type=int, default=4)
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", type=float, default=0.1)
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--sd-p-last", type=float, default=0.5)
-    p.add_argument("--device", type=str, default="auto")
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--save-every", type=int, default=1)
-    p.add_argument(
-        "--grad-accum-steps",
-        type=int,
-        default=1,
-        help="Number of gradient accumulation steps.",
-    )
-    p.add_argument(
-        "--amp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable automatic mixed precision on CUDA.",
-    )
-    p.add_argument(
-        "--amp-dtype",
-        type=str,
-        choices=["bf16", "fp16"],
-        default="bf16",
-        help="AMP compute dtype.",
-    )
-    p.add_argument(
-        "--channels-last",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use channels_last memory format for better convolution throughput.",
-    )
-    p.add_argument(
-        "--tf32",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable TF32 matmul/cuDNN for speed on supported GPUs.",
-    )
-    p.add_argument(
-        "--no-scale-lr",
-        action="store_true",
-        help="Disable linear LR scaling by world size (DDP default scales).",
-    )
+    p.add_argument("--grad-accum-steps", type=int, default=1)
     return p.parse_args()
 
 
@@ -130,9 +98,6 @@ def train_one_epoch(
     epoch: int,
     epochs: int,
     grad_accum_steps: int = 1,
-    amp_enabled: bool = False,
-    amp_dtype: torch.dtype = torch.bfloat16,
-    channels_last: bool = False,
 ) -> dict[str, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -145,9 +110,7 @@ def train_one_epoch(
     pbar = tqdm(loader, desc=f"train {epoch + 1}/{epochs}", leave=False, disable=dist.is_initialized() and dist.get_rank() != 0)
     optimizer.zero_grad(set_to_none=True)
     for step_idx, (images, target) in enumerate(pbar, start=1):
-        images = images.to(device, non_blocking=True)
-        if channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
+        images = images.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
         target = target.to(device, non_blocking=True)
 
         is_update_step = (step_idx % accum == 0) or (step_idx == num_batches)
@@ -158,7 +121,7 @@ def train_one_epoch(
             sync_ctx = model.no_sync()
 
         with sync_ctx:
-            with torch.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+            with torch.autocast(device_type="cuda", dtype=AMP_DTYPE):
                 output = model(images)
                 loss = criterion(output, target)
             (loss / current_accum).backward()
@@ -211,21 +174,16 @@ def sync_train_stats(stats: dict[str, float], device: torch.device) -> dict[str,
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model: nn.Module, loader, criterion: nn.Module, device: torch.device) -> dict[str, float]:
     model.eval()
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
     top5_meter = AverageMeter()
-    channels_last = getattr(model, "_use_channels_last", False)
-    amp_enabled = bool(getattr(model, "_amp_enabled", False))
-    amp_dtype = getattr(model, "_amp_dtype", torch.bfloat16)
     for images, target in tqdm(loader, desc="val", leave=False):
-        images = images.to(device, non_blocking=True)
-        if channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
+        images = images.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
         target = target.to(device, non_blocking=True)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+        with torch.autocast(device_type="cuda", dtype=AMP_DTYPE):
             output = model(images)
             loss = criterion(output, target)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -233,7 +191,41 @@ def evaluate(model: nn.Module, loader, criterion: nn.Module, device: torch.devic
         loss_meter.update(float(loss.item()), bs)
         top1_meter.update(float(acc1.item()), bs)
         top5_meter.update(float(acc5.item()), bs)
-    return {"loss": loss_meter.avg, "top1": top1_meter.avg, "top5": top5_meter.avg}
+    return {
+        "loss": loss_meter.avg,
+        "top1": top1_meter.avg,
+        "top5": top5_meter.avg,
+        "_loss_sum": loss_meter.sum,
+        "_loss_cnt": loss_meter.count,
+        "_top1_sum": top1_meter.sum,
+        "_top1_cnt": top1_meter.count,
+        "_top5_sum": top5_meter.sum,
+        "_top5_cnt": top5_meter.count,
+    }
+
+
+def sync_eval_stats(stats: dict[str, float], device: torch.device) -> dict[str, float]:
+    if not dist.is_initialized():
+        return {k: v for k, v in stats.items() if not k.startswith("_")}
+    t = torch.tensor(
+        [
+            stats["_loss_sum"],
+            stats["_loss_cnt"],
+            stats["_top1_sum"],
+            stats["_top1_cnt"],
+            stats["_top5_sum"],
+            stats["_top5_cnt"],
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    ls, lc, u1, c1, u5, c5 = t.tolist()
+    return {
+        "loss": float(ls / max(lc, 1)),
+        "top1": float(u1 / max(c1, 1)),
+        "top5": float(u5 / max(c5, 1)),
+    }
 
 
 def main() -> None:
@@ -242,16 +234,16 @@ def main() -> None:
 
     if distributed:
         device = torch.device("cuda", local_rank)
-        lr = args.lr * world_size if not args.no_scale_lr else args.lr
+        lr = args.lr * world_size
     else:
-        device = device_from_flag(args.device)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         lr = args.lr
 
     set_seed(args.seed + rank)
+    torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
-    if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = args.tf32
-        torch.backends.cudnn.allow_tf32 = args.tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     output_dir = Path(args.output_dir) / args.model
     if rank == 0:
@@ -263,19 +255,15 @@ def main() -> None:
     ckpt_best = output_dir / "best.pt"
     history_path = output_dir / "history.jsonl"
 
-    model = create_model(args).to(device)
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    amp_enabled = bool(args.amp and device.type == "cuda")
-    model._use_channels_last = args.channels_last
-    model._amp_enabled = amp_enabled
-    model._amp_dtype = amp_dtype
+    model = create_model(args).to(device).to(memory_format=torch.channels_last)
     if distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        model.module._use_channels_last = args.channels_last
-        model.module._amp_enabled = amp_enabled
-        model.module._amp_dtype = amp_dtype
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            static_graph=True,
+            gradient_as_bucket_view=True,
+        )
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
     optimizer = torch.optim.SGD(
@@ -302,9 +290,12 @@ def main() -> None:
             print(f"Resumed from {resume_path}, start_epoch={start_epoch}")
 
     train_sampler: DistributedSampler | None = None
+    val_sampler: DistributedSampler | None = None
     if distributed:
         train_ds = datasets.ImageFolder(str(Path(args.data_root) / "train"))
         train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+        val_ds = datasets.ImageFolder(str(Path(args.data_root) / "val"))
+        val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)
 
     train_loader, val_loader = build_imagenet_loaders(
         data_root=args.data_root,
@@ -312,8 +303,9 @@ def main() -> None:
         val_batch_size=args.val_batch_size,
         workers=args.workers,
         train_sampler=train_sampler,
-        val_sampler=None,
-        build_val=not distributed or rank == 0,
+        val_sampler=val_sampler,
+        build_val=True,
+        prefetch_factor=args.prefetch_factor,
     )
 
     for epoch in range(start_epoch, args.epochs):
@@ -329,26 +321,16 @@ def main() -> None:
             epoch=epoch,
             epochs=args.epochs,
             grad_accum_steps=args.grad_accum_steps,
-            amp_enabled=amp_enabled,
-            amp_dtype=amp_dtype,
-            channels_last=args.channels_last,
         )
         train_stats = sync_train_stats(train_raw, device)
 
-        if distributed:
-            dist.barrier()
-            if rank == 0:
-                val_stats = evaluate(
-                    model=eval_model_for_inference(model),
-                    loader=val_loader,
-                    criterion=criterion,
-                    device=device,
-                )
-            else:
-                val_stats = {"loss": 0.0, "top1": 0.0, "top5": 0.0}
-            dist.barrier()
-        else:
-            val_stats = evaluate(model=model, loader=val_loader, criterion=criterion, device=device)
+        val_raw = evaluate(
+            model=eval_model_for_inference(model),
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+        )
+        val_stats = sync_eval_stats(val_raw, device)
 
         scheduler.step()
         cur_lr = optimizer.param_groups[0]["lr"]

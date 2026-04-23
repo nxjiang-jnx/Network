@@ -19,6 +19,7 @@ def build_imagenet_loaders(
     train_sampler: Optional[DistributedSampler] = None,
     val_sampler: Optional[DistributedSampler] = None,
     build_val: bool = True,
+    prefetch_factor: int = 2,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     root = Path(data_root)
     train_dir = root / "train"
@@ -61,6 +62,7 @@ def build_imagenet_loaders(
         pin_memory=True,
         drop_last=True,
         persistent_workers=workers > 0,
+        prefetch_factor=prefetch_factor if workers > 0 else None,
     )
     if not build_val:
         return train_loader, None
@@ -75,6 +77,7 @@ def build_imagenet_loaders(
         pin_memory=True,
         drop_last=False,
         persistent_workers=workers > 0,
+        prefetch_factor=prefetch_factor if workers > 0 else None,
     )
     return train_loader, val_loader
 
@@ -85,6 +88,7 @@ def build_imagenet_val_loader(
     workers: int,
     val_resize_size: int = 256,
     val_crop_size: int = 224,
+    prefetch_factor: int = 2,
 ) -> DataLoader:
     root = Path(data_root)
     val_dir = root / "val"
@@ -111,6 +115,7 @@ def build_imagenet_val_loader(
         pin_memory=True,
         drop_last=False,
         persistent_workers=workers > 0,
+        prefetch_factor=prefetch_factor if workers > 0 else None,
     )
 
 

@@ -5,9 +5,11 @@ DATA_ROOT="${1:-./data/imagenet1k_imagefolder}"
 OUTPUT_DIR="${2:-outputs}"
 NPROC="${NPROC:-4}"
 BASE_PORT="${MASTER_PORT:-29501}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-112}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-200}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-256}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+WORKERS="${WORKERS:-20}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
 
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 # Reduce allocator fragmentation risk near memory limit.
@@ -21,7 +23,8 @@ torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
   --epochs 120 \
   --batch-size "${TRAIN_BATCH_SIZE}" \
   --val-batch-size "${VAL_BATCH_SIZE}" \
-  --workers 8 \
+  --workers "${WORKERS}" \
+  --prefetch-factor "${PREFETCH_FACTOR}" \
   --lr 0.1 \
   --momentum 0.9 \
   --weight-decay 1e-4 \
@@ -38,7 +41,8 @@ torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
   --epochs 120 \
   --batch-size "${TRAIN_BATCH_SIZE}" \
   --val-batch-size "${VAL_BATCH_SIZE}" \
-  --workers 8 \
+  --workers "${WORKERS}" \
+  --prefetch-factor "${PREFETCH_FACTOR}" \
   --lr 0.1 \
   --momentum 0.9 \
   --weight-decay 1e-4 \
