@@ -3,7 +3,8 @@ set -euo pipefail
 
 DATA_ROOT="${1:-./data/imagenet1k_imagefolder}"
 OUTPUT_DIR="${2:-outputs}"
-DEVICE="${3:-cuda}"
+GPU_RESNET="${GPU_RESNET:-cuda:0}"
+GPU_SD="${GPU_SD:-cuda:1}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-256}"
 WORKERS="${WORKERS:-20}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
@@ -16,8 +17,9 @@ python explore_deletion.py \
   --batch-size "${VAL_BATCH_SIZE}" \
   --workers "${WORKERS}" \
   --prefetch-factor "${PREFETCH_FACTOR}" \
-  --device "${DEVICE}" \
-  --output-dir "${OUTPUT_DIR}/explore"
+  --device "${GPU_RESNET}" \
+  --output-dir "${OUTPUT_DIR}/explore" &
+PID_EXP_RESNET=$!
 
 python explore_deletion.py \
   --data-root "${DATA_ROOT}" \
@@ -27,8 +29,12 @@ python explore_deletion.py \
   --batch-size "${VAL_BATCH_SIZE}" \
   --workers "${WORKERS}" \
   --prefetch-factor "${PREFETCH_FACTOR}" \
-  --device "${DEVICE}" \
-  --output-dir "${OUTPUT_DIR}/explore"
+  --device "${GPU_SD}" \
+  --output-dir "${OUTPUT_DIR}/explore" &
+PID_EXP_SD=$!
+
+wait "${PID_EXP_RESNET}"
+wait "${PID_EXP_SD}"
 
 python analyze_results.py \
   --resnet-csv "${OUTPUT_DIR}/explore/resnet152/deletion_curve.csv" \
@@ -43,8 +49,9 @@ python speedup_inference.py \
   --batch-size "${VAL_BATCH_SIZE}" \
   --workers "${WORKERS}" \
   --prefetch-factor "${PREFETCH_FACTOR}" \
-  --device "${DEVICE}" \
-  --output-dir "${OUTPUT_DIR}/accel"
+  --device "${GPU_RESNET}" \
+  --output-dir "${OUTPUT_DIR}/accel" &
+PID_ACC_RESNET=$!
 
 python speedup_inference.py \
   --data-root "${DATA_ROOT}" \
@@ -55,5 +62,9 @@ python speedup_inference.py \
   --batch-size "${VAL_BATCH_SIZE}" \
   --workers "${WORKERS}" \
   --prefetch-factor "${PREFETCH_FACTOR}" \
-  --device "${DEVICE}" \
-  --output-dir "${OUTPUT_DIR}/accel"
+  --device "${GPU_SD}" \
+  --output-dir "${OUTPUT_DIR}/accel" &
+PID_ACC_SD=$!
+
+wait "${PID_ACC_RESNET}"
+wait "${PID_ACC_SD}"
