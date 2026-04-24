@@ -46,6 +46,8 @@ torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
   --lr 0.1 \
   --momentum 0.9 \
   --weight-decay 1e-4 \
-  --label-smoothing 0.1 \
-  --warmup-epochs 5 \
+  --label-smoothing 0.0 \
+  --warmup-epochs 0 \
+  --lr-scheduler multistep \
+  --lr-milestones 30,60,90 \
   --grad-accum-steps "${GRAD_ACCUM_STEPS}"

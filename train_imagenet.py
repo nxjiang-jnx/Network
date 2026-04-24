@@ -8,13 +8,13 @@ from pathlib import Path
 
 # Must run before torch initializes CUDA.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, MultiStepLR, SequentialLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from torchvision import datasets
@@ -39,14 +39,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=0.1)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--label-smoothing", type=float, default=0.1)
-    p.add_argument("--warmup-epochs", type=int, default=5)
+    p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--warmup-epochs", type=int, default=0)
+    p.add_argument("--lr-scheduler", type=str, choices=["multistep", "cosine"], default="multistep")
+    p.add_argument("--lr-milestones", type=str, default="30,60,90")
     p.add_argument("--sd-p-last", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=3407)
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--save-every", type=int, default=1)
     p.add_argument("--grad-accum-steps", type=int, default=1)
     return p.parse_args()
+
+
+def parse_milestones(spec: str, epochs: int) -> list[int]:
+    vals: list[int] = []
+    for x in spec.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        v = int(x)
+        if 0 < v < epochs:
+            vals.append(v)
+    vals = sorted(set(vals))
+    if not vals:
+        vals = [30, 60, 90]
+    return vals
 
 
 def setup_distributed() -> tuple[bool, int, int, int]:
@@ -239,6 +256,7 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         lr = args.lr
 
+    # Keep model/data shuffling deterministic per-rank while SD gate sampling is synchronized by broadcast.
     set_seed(args.seed + rank)
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
@@ -273,11 +291,18 @@ def main() -> None:
         model.parameters(), lr=lr, momentum=args.momentum, weight_decay=args.weight_decay
     )
 
-    cosine = CosineAnnealingLR(optimizer, T_max=max(args.epochs - args.warmup_epochs, 1))
-    warmup = LinearLR(optimizer, start_factor=0.01, total_iters=max(args.warmup_epochs, 1))
-    scheduler = SequentialLR(
-        optimizer, schedulers=[warmup, cosine], milestones=[args.warmup_epochs]
-    )
+    if args.lr_scheduler == "multistep":
+        scheduler = MultiStepLR(
+            optimizer,
+            milestones=parse_milestones(args.lr_milestones, args.epochs),
+            gamma=0.1,
+        )
+    else:
+        cosine = CosineAnnealingLR(optimizer, T_max=max(args.epochs - args.warmup_epochs, 1))
+        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=max(args.warmup_epochs, 1))
+        scheduler = SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[args.warmup_epochs]
+        )
 
     start_epoch = 0
     best_top1 = 0.0

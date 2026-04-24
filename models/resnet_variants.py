@@ -71,8 +71,30 @@ class StochasticDepthResNet(nn.Module):
     def get_all_survival_probs(self) -> List[float]:
         return [x.survival_prob for x in self.block_meta]
 
+    @staticmethod
+    def _is_torchvision_bottleneck(block: nn.Module) -> bool:
+        return all(
+            hasattr(block, name)
+            for name in ("conv1", "bn1", "conv2", "bn2", "conv3", "bn3", "relu")
+        )
+
+    @staticmethod
+    def _bottleneck_residual_and_identity(
+        block: nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        identity = x if getattr(block, "downsample", None) is None else block.downsample(x)
+        out = block.conv1(x)
+        out = block.bn1(out)
+        out = block.relu(out)
+        out = block.conv2(out)
+        out = block.bn2(out)
+        out = block.relu(out)
+        out = block.conv3(out)
+        out = block.bn3(out)
+        return out, identity
+
     def _run_block_train(self, x: torch.Tensor, block: nn.Module, p: float) -> torch.Tensor:
-        """Huang et al., CVPR 2016: with prob p keep block(x); else identity (or projection-only if downsample)."""
+        """Huang et al. CVPR'16: with prob p keep residual branch, else bypass to shortcut."""
         if p >= 1.0:
             return block(x)
         # DDP: one Bernoulli per block per forward, broadcast so all ranks share the same graph.
@@ -84,17 +106,19 @@ class StochasticDepthResNet(nn.Module):
             keep = u.item() < p
         else:
             keep = torch.rand(1, device=x.device).item() < p
+        if not self._is_torchvision_bottleneck(block):
+            return block(x) if keep else x
+        residual, identity = self._bottleneck_residual_and_identity(block, x)
         if keep:
-            return block(x)
-        # Bypass residual stack; never inplace-ReLU on `x` (aliases prior graph nodes).
-        if getattr(block, "downsample", None) is not None:
-            return F.relu(block.downsample(x), inplace=False)
-        return x
+            return F.relu(residual + identity, inplace=False)
+        return F.relu(identity, inplace=False)
 
     def _run_block_eval(self, x: torch.Tensor, block: nn.Module, p: float) -> torch.Tensor:
-        # Inference: full-depth deterministic forward (Huang et al. Sec. 3.4 / common practice).
-        del p
-        return block(x)
+        # Paper-consistent test-time expectation: H_l = ReLU(f_l * p_l + h_l).
+        if not self._is_torchvision_bottleneck(block):
+            return block(x)
+        residual, identity = self._bottleneck_residual_and_identity(block, x)
+        return F.relu(residual * p + identity, inplace=False)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
