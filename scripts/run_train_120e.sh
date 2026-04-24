@@ -16,21 +16,21 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 export MASTER_PORT="${BASE_PORT}"
-torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
-  --data-root "${DATA_ROOT}" \
-  --output-dir "${OUTPUT_DIR}" \
-  --model resnet152 \
-  --epochs 120 \
-  --batch-size "${TRAIN_BATCH_SIZE}" \
-  --val-batch-size "${VAL_BATCH_SIZE}" \
-  --workers "${WORKERS}" \
-  --prefetch-factor "${PREFETCH_FACTOR}" \
-  --lr 0.1 \
-  --momentum 0.9 \
-  --weight-decay 1e-4 \
-  --label-smoothing 0.1 \
-  --warmup-epochs 5 \
-  --grad-accum-steps "${GRAD_ACCUM_STEPS}"
+# torchrun --nproc_per_node="${NPROC}" train_imagenet.py \
+#   --data-root "${DATA_ROOT}" \
+#   --output-dir "${OUTPUT_DIR}" \
+#   --model resnet152 \
+#   --epochs 120 \
+#   --batch-size "${TRAIN_BATCH_SIZE}" \
+#   --val-batch-size "${VAL_BATCH_SIZE}" \
+#   --workers "${WORKERS}" \
+#   --prefetch-factor "${PREFETCH_FACTOR}" \
+#   --lr 0.1 \
+#   --momentum 0.9 \
+#   --weight-decay 1e-4 \
+#   --label-smoothing 0.1 \
+#   --warmup-epochs 5 \
+#   --grad-accum-steps "${GRAD_ACCUM_STEPS}"
 
 export MASTER_PORT=$((BASE_PORT + 1))
 torchrun --nproc_per_node="${NPROC}" train_imagenet.py \

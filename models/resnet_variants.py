@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as tv_models
 
 
@@ -70,19 +72,29 @@ class StochasticDepthResNet(nn.Module):
         return [x.survival_prob for x in self.block_meta]
 
     def _run_block_train(self, x: torch.Tensor, block: nn.Module, p: float) -> torch.Tensor:
+        """Huang et al., CVPR 2016: with prob p keep block(x); else identity (or projection-only if downsample)."""
         if p >= 1.0:
             return block(x)
-        if torch.rand(1, device=x.device).item() < p:
+        # DDP: one Bernoulli per block per forward, broadcast so all ranks share the same graph.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            u = torch.empty(1, device=x.device, dtype=torch.float32)
+            if dist.get_rank() == 0:
+                u.uniform_(0.0, 1.0)
+            dist.broadcast(u, src=0)
+            keep = u.item() < p
+        else:
+            keep = torch.rand(1, device=x.device).item() < p
+        if keep:
             return block(x)
+        # Bypass residual stack; never inplace-ReLU on `x` (aliases prior graph nodes).
+        if getattr(block, "downsample", None) is not None:
+            return F.relu(block.downsample(x), inplace=False)
         return x
 
     def _run_block_eval(self, x: torch.Tensor, block: nn.Module, p: float) -> torch.Tensor:
-        if p >= 1.0:
-            return block(x)
-        out = block(x)
-        identity = x
-        residual = out - identity
-        return identity + p * residual
+        # Inference: full-depth deterministic forward (Huang et al. Sec. 3.4 / common practice).
+        del p
+        return block(x)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
