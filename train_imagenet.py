@@ -275,7 +275,7 @@ def main() -> None:
 
     model = create_model(args).to(device).to(memory_format=torch.channels_last)
     if distributed:
-        # Stochastic depth skips whole blocks → unused params vary per step; static_graph forbids that.
+        # Stochastic depth can skip whole blocks, so parameter usage is dynamic per step.
         use_sd = args.model == "resnet152_sd"
         model = DDP(
             model,
@@ -283,7 +283,7 @@ def main() -> None:
             output_device=local_rank,
             static_graph=not use_sd,
             find_unused_parameters=use_sd,
-            gradient_as_bucket_view=not use_sd,
+            gradient_as_bucket_view=True,
         )
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)

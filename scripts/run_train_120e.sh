@@ -12,8 +12,8 @@ WORKERS="${WORKERS:-20}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
 
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-# Reduce allocator fragmentation risk near memory limit.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 export MASTER_PORT="${BASE_PORT}"
 # torchrun --nproc_per_node="${NPROC}" train_imagenet.py \

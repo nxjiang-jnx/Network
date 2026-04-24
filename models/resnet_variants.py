@@ -6,7 +6,6 @@ from typing import Iterable, List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.models as tv_models
 
 
@@ -35,6 +34,12 @@ class StochasticDepthResNet(nn.Module):
         self.total_blocks = len(self.blocks)
         self.p_last = p_last
         self.block_meta = self._make_block_meta()
+        self._is_bottleneck_block = [self._is_torchvision_bottleneck(b) for b in self.blocks]
+        self.register_buffer(
+            "_survival_probs",
+            torch.tensor([m.survival_prob for m in self.block_meta], dtype=torch.float32),
+            persistent=False,
+        )
         self.active_block_count = self.total_blocks
 
     @staticmethod
@@ -93,41 +98,52 @@ class StochasticDepthResNet(nn.Module):
         out = block.bn3(out)
         return out, identity
 
-    def _run_block_train(self, x: torch.Tensor, block: nn.Module, p: float) -> torch.Tensor:
-        """Huang et al. CVPR'16: with prob p keep residual branch, else bypass to shortcut."""
-        if p >= 1.0:
-            return block(x)
-        # DDP: one Bernoulli per block per forward, broadcast so all ranks share the same graph.
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            u = torch.empty(1, device=x.device, dtype=torch.float32)
-            if dist.get_rank() == 0:
-                u.uniform_(0.0, 1.0)
-            dist.broadcast(u, src=0)
-            keep = u.item() < p
-        else:
-            keep = torch.rand(1, device=x.device).item() < p
-        if not self._is_torchvision_bottleneck(block):
+    def _run_block_train(
+        self, x: torch.Tensor, block: nn.Module, keep: bool, is_bottleneck: bool
+    ) -> torch.Tensor:
+        """Huang et al. CVPR'16: keep residual branch or bypass to shortcut."""
+        if not is_bottleneck:
             return block(x) if keep else x
+        if not keep:
+            identity = x if getattr(block, "downsample", None) is None else block.downsample(x)
+            return torch.relu(identity)
         residual, identity = self._bottleneck_residual_and_identity(block, x)
-        if keep:
-            return F.relu(residual + identity, inplace=False)
-        return F.relu(identity, inplace=False)
+        return torch.relu(residual + identity)
 
-    def _run_block_eval(self, x: torch.Tensor, block: nn.Module, p: float) -> torch.Tensor:
+    def _run_block_eval(
+        self, x: torch.Tensor, block: nn.Module, p: float, is_bottleneck: bool
+    ) -> torch.Tensor:
         # Paper-consistent test-time expectation: H_l = ReLU(f_l * p_l + h_l).
-        if not self._is_torchvision_bottleneck(block):
+        if not is_bottleneck:
             return block(x)
         residual, identity = self._bottleneck_residual_and_identity(block, x)
-        return F.relu(residual * p + identity, inplace=False)
+        return torch.relu(residual * p + identity)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        for i, block in enumerate(self.blocks[: self.active_block_count]):
-            p = self.block_meta[i].survival_prob
-            if self.training:
-                x = self._run_block_train(x, block, p)
+        keep_mask: Optional[list[bool]] = None
+        active = self.active_block_count
+        if self.training:
+            probs = self._survival_probs[:active]
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                mask = torch.empty(active, device=x.device, dtype=torch.bool)
+                if dist.get_rank() == 0:
+                    mask.copy_(torch.rand(active, device=x.device) < probs)
+                dist.broadcast(mask, src=0)
             else:
-                x = self._run_block_eval(x, block, p)
+                mask = torch.rand(active, device=x.device) < probs
+            # Avoid per-block .item() host sync; sync once per step.
+            keep_mask = mask.cpu().tolist()
+
+        for i in range(active):
+            block = self.blocks[i]
+            is_bottleneck = self._is_bottleneck_block[i]
+            if self.training:
+                assert keep_mask is not None
+                x = self._run_block_train(x, block, keep=keep_mask[i], is_bottleneck=is_bottleneck)
+            else:
+                p = self.block_meta[i].survival_prob
+                x = self._run_block_eval(x, block, p=p, is_bottleneck=is_bottleneck)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
