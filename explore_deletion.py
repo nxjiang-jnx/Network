@@ -101,7 +101,7 @@ def main() -> None:
             }
         )
         print(
-            f"deleted={deleted:02d} active={active:02d}/{total_blocks} "
+            f"[{args.model}] deleted={deleted:02d} active={active:02d}/{total_blocks} "
             f"top1={top1:.3f} val_error={error:.3f}"
         )
 
@@ -122,8 +122,8 @@ def main() -> None:
     fig_path = out_dir / "deletion_curve.png"
     plt.tight_layout()
     plt.savefig(fig_path, dpi=140)
-    print(f"Saved {csv_path}")
-    print(f"Saved {fig_path}")
+    print(f"[{args.model}] Saved {csv_path}")
+    print(f"[{args.model}] Saved {fig_path}")
 
 
 if __name__ == "__main__":

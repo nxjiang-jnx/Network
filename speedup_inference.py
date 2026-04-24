@@ -143,7 +143,7 @@ def main() -> None:
         }
         rows.append(row)
         print(
-            f"deleted={deleted:02d} top1={top1:.3f} delta_err={delta_err:.3f} "
+            f"[{args.model}] deleted={deleted:02d} top1={top1:.3f} delta_err={delta_err:.3f} "
             f"thr={thr:.1f} img/s speedup={speedup:.3f}x"
         )
         if delta_err <= args.error_budget:
@@ -168,9 +168,9 @@ def main() -> None:
             f"speedup={chosen['speedup_vs_full']:.4f}x"
         )
     best_path.write_text(msg + "\n", encoding="utf-8")
-    print(msg)
-    print(f"Saved {csv_path}")
-    print(f"Saved {best_path}")
+    print(f"[{args.model}] {msg}")
+    print(f"[{args.model}] Saved {csv_path}")
+    print(f"[{args.model}] Saved {best_path}")
 
 
 if __name__ == "__main__":

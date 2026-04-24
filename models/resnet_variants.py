@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,27 @@ def _match_fc_input_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
     return x[:, :target_dim]
 
 
+def _last_active_stage_idx(stage_block_counts: Sequence[int], active: int) -> int:
+    acc = 0
+    for stage_idx, count in enumerate(stage_block_counts):
+        acc += count
+        if active <= acc:
+            return stage_idx
+    return len(stage_block_counts) - 1
+
+
+def _project_to_final_stage(
+    x: torch.Tensor, stages: Sequence[nn.Sequential], last_stage_idx: int
+) -> torch.Tensor:
+    # Keep shape semantics close to residual skip paths when truncation crosses stage boundaries.
+    for next_stage_idx in range(last_stage_idx + 1, len(stages)):
+        first_block = stages[next_stage_idx][0]
+        downsample = getattr(first_block, "downsample", None)
+        if downsample is not None:
+            x = torch.relu(downsample(x))
+    return x
+
+
 class StochasticDepthResNet(nn.Module):
     def __init__(self, p_last: float = 0.5, num_classes: int = 1000) -> None:
         super().__init__()
@@ -40,6 +61,7 @@ class StochasticDepthResNet(nn.Module):
         self.fc = base.fc
 
         self.stages = nn.ModuleList([base.layer1, base.layer2, base.layer3, base.layer4])
+        self._stage_block_counts = [len(stage) for stage in self.stages]
         self.stage_names = ["layer1", "layer2", "layer3", "layer4"]
         self.blocks = self._flatten_blocks(self.stages)
         self.total_blocks = len(self.blocks)
@@ -155,6 +177,8 @@ class StochasticDepthResNet(nn.Module):
             else:
                 p = self.block_meta[i].survival_prob
                 x = self._run_block_eval(x, block, p=p, is_bottleneck=is_bottleneck)
+        last_stage_idx = _last_active_stage_idx(self._stage_block_counts, active)
+        x = _project_to_final_stage(x, self.stages, last_stage_idx)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -174,6 +198,7 @@ class TruncatableResNet(nn.Module):
         self.avgpool = base.avgpool
         self.fc = base.fc
         self.stages = nn.ModuleList([base.layer1, base.layer2, base.layer3, base.layer4])
+        self._stage_block_counts = [len(stage) for stage in self.stages]
         self.blocks = nn.ModuleList(
             [block for stage in self.stages for block in stage]
         )
@@ -187,8 +212,11 @@ class TruncatableResNet(nn.Module):
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        for block in self.blocks[: self.active_block_count]:
+        active = self.active_block_count
+        for block in self.blocks[:active]:
             x = block(x)
+        last_stage_idx = _last_active_stage_idx(self._stage_block_counts, active)
+        x = _project_to_final_stage(x, self.stages, last_stage_idx)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
