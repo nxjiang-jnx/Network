@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List
 
@@ -11,6 +12,8 @@ import torch
 from models import build_resnet152, build_resnet152_stochastic_depth
 from utils.data import build_imagenet_loaders, device_from_flag
 from utils.metrics import accuracy
+
+AMP_DTYPE = torch.bfloat16
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,7 +24,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sd-p-last", type=float, default=0.5)
     p.add_argument("--error-budget", type=float, default=0.5)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--workers", type=int, default=20)
+    p.add_argument("--prefetch-factor", type=int, default=6)
     p.add_argument("--warmup-iters", type=int, default=20)
     p.add_argument("--bench-iters", type=int, default=80)
     p.add_argument("--device", type=str, default="auto")
@@ -40,10 +44,16 @@ def eval_top1(model, loader, device: torch.device) -> float:
     model.eval()
     correct = 0.0
     total = 0
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=AMP_DTYPE)
+        if device.type == "cuda"
+        else nullcontext()
+    )
     for images, target in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
         target = target.to(device, non_blocking=True)
-        out = model(images)
+        with amp_ctx:
+            out = model(images)
         acc1 = accuracy(out, target, topk=(1,))[0].item()
         bs = images.shape[0]
         correct += (acc1 / 100.0) * bs
@@ -54,16 +64,23 @@ def eval_top1(model, loader, device: torch.device) -> float:
 @torch.no_grad()
 def benchmark_throughput(model, device: torch.device, batch_size: int, warmup: int, iters: int) -> float:
     model.eval()
-    x = torch.randn(batch_size, 3, 224, 224, device=device)
+    x = torch.randn(batch_size, 3, 224, 224, device=device).contiguous(memory_format=torch.channels_last)
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=AMP_DTYPE)
+        if device.type == "cuda"
+        else nullcontext()
+    )
     if device.type == "cuda":
         torch.cuda.synchronize()
     for _ in range(warmup):
-        _ = model(x)
+        with amp_ctx:
+            _ = model(x)
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        _ = model(x)
+        with amp_ctx:
+            _ = model(x)
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
@@ -73,6 +90,10 @@ def benchmark_throughput(model, device: torch.device, batch_size: int, warmup: i
 def main() -> None:
     args = parse_args()
     device = device_from_flag(args.device)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     out_dir = Path(args.output_dir) / args.model
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,9 +102,10 @@ def main() -> None:
         batch_size=args.batch_size,
         val_batch_size=args.batch_size,
         workers=args.workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
-    model = create_model(args).to(device)
+    model = create_model(args).to(device).to(memory_format=torch.channels_last)
     state = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(state["model"], strict=True)
     total_blocks = model.total_blocks

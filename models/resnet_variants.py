@@ -17,6 +17,17 @@ class BlockMeta:
     survival_prob: float
 
 
+def _match_fc_input_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Keep truncation runnable when active depth crosses stage boundaries."""
+    cur_dim = x.shape[1]
+    if cur_dim == target_dim:
+        return x
+    if cur_dim < target_dim:
+        pad = x.new_zeros(x.shape[0], target_dim - cur_dim)
+        return torch.cat((x, pad), dim=1)
+    return x[:, :target_dim]
+
+
 class StochasticDepthResNet(nn.Module):
     def __init__(self, p_last: float = 0.5, num_classes: int = 1000) -> None:
         super().__init__()
@@ -150,6 +161,7 @@ class StochasticDepthResNet(nn.Module):
         x = self.forward_features(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+        x = _match_fc_input_dim(x, self.fc.in_features)
         x = self.fc(x)
         return x
 
@@ -183,6 +195,7 @@ class TruncatableResNet(nn.Module):
         x = self.forward_features(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+        x = _match_fc_input_dim(x, self.fc.in_features)
         x = self.fc(x)
         return x
 

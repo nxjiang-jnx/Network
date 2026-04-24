@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List
 
@@ -14,6 +15,8 @@ from models import build_resnet152, build_resnet152_stochastic_depth
 from utils.data import build_imagenet_loaders, device_from_flag
 from utils.metrics import accuracy
 
+AMP_DTYPE = torch.bfloat16
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Back-to-front layer deletion study")
@@ -22,7 +25,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", choices=["resnet152", "resnet152_sd"], required=True)
     p.add_argument("--sd-p-last", type=float, default=0.5)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--workers", type=int, default=20)
+    p.add_argument("--prefetch-factor", type=int, default=6)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--max-delete", type=int, default=-1)
     p.add_argument("--step", type=int, default=1)
@@ -41,10 +45,16 @@ def evaluate_top1(model: nn.Module, loader, device: torch.device) -> float:
     model.eval()
     correct = 0.0
     total = 0
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=AMP_DTYPE)
+        if device.type == "cuda"
+        else nullcontext()
+    )
     for images, target in tqdm(loader, desc="eval", leave=False):
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
         target = target.to(device, non_blocking=True)
-        out = model(images)
+        with amp_ctx:
+            out = model(images)
         acc1 = accuracy(out, target, topk=(1,))[0].item()
         bs = images.size(0)
         correct += (acc1 / 100.0) * bs
@@ -55,6 +65,10 @@ def evaluate_top1(model: nn.Module, loader, device: torch.device) -> float:
 def main() -> None:
     args = parse_args()
     device = device_from_flag(args.device)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     out_dir = Path(args.output_dir) / args.model
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -63,13 +77,14 @@ def main() -> None:
         batch_size=args.batch_size,
         val_batch_size=args.batch_size,
         workers=args.workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
-    model = build_model(args).to(device)
+    model = build_model(args).to(device).to(memory_format=torch.channels_last)
     state = torch.load(args.checkpoint, map_location="cpu")
     model.load_state_dict(state["model"], strict=True)
     total_blocks = model.total_blocks
-    max_delete = total_blocks if args.max_delete < 0 else min(args.max_delete, total_blocks - 1)
+    max_delete = total_blocks - 1 if args.max_delete < 0 else min(args.max_delete, total_blocks - 1)
 
     rows: List[Dict[str, float]] = []
     for deleted in range(0, max_delete + 1, args.step):
