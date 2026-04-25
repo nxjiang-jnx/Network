@@ -8,7 +8,7 @@ GPU_SD="${GPU_SD:-cuda:1}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-256}"
 WORKERS="${WORKERS:-20}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-6}"
-ERROR_BUDGET="${ERROR_BUDGET:-0.5}"
+TARGET_TOP1="${TARGET_TOP1:-75.0}"
 
 python explore_deletion.py \
   --data-root "${DATA_ROOT}" \
@@ -42,29 +42,10 @@ python analyze_results.py \
   --output "${OUTPUT_DIR}/analysis_report.md"
 
 python speedup_inference.py \
-  --data-root "${DATA_ROOT}" \
-  --model resnet152 \
-  --checkpoint "${OUTPUT_DIR}/resnet152/best.pt" \
-  --error-budget "${ERROR_BUDGET}" \
-  --batch-size "${VAL_BATCH_SIZE}" \
-  --workers "${WORKERS}" \
-  --prefetch-factor "${PREFETCH_FACTOR}" \
-  --device "${GPU_RESNET}" \
-  --output-dir "${OUTPUT_DIR}/accel" &
-PID_ACC_RESNET=$!
-
-python speedup_inference.py \
-  --data-root "${DATA_ROOT}" \
-  --model resnet152_sd \
-  --sd-p-last 0.5 \
   --checkpoint "${OUTPUT_DIR}/resnet152_sd/best.pt" \
-  --error-budget "${ERROR_BUDGET}" \
+  --deletion-csv "${OUTPUT_DIR}/explore/resnet152_sd/deletion_curve.csv" \
+  --target-top1 "${TARGET_TOP1}" \
+  --sd-p-last 0.5 \
   --batch-size "${VAL_BATCH_SIZE}" \
-  --workers "${WORKERS}" \
-  --prefetch-factor "${PREFETCH_FACTOR}" \
   --device "${GPU_SD}" \
-  --output-dir "${OUTPUT_DIR}/accel" &
-PID_ACC_SD=$!
-
-wait "${PID_ACC_RESNET}"
-wait "${PID_ACC_SD}"
+  --output-dir "${OUTPUT_DIR}/accel/resnet152_sd"
