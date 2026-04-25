@@ -37,13 +37,12 @@ Expected ImageNet folder:
     ...
 ```
 
-Train both models (default: 4-way DDP via `torchrun`, see `scripts/run_train_120e.sh`):
+Train both models:
 
 ```bash
 bash scripts/run_train_120e.sh
 ```
 
-Single GPU: `NPROC=1 bash scripts/run_train_120e.sh`
 
 Run deletion study + acceleration:
 
@@ -61,14 +60,6 @@ Main outputs:
 - `outputs/accel/resnet152/accel_tradeoff.csv`
 - `outputs/accel/resnet152_sd/accel_tradeoff.csv`
 
-## Notes on implementation
-
-- ResNet-152 uses canonical stage depths `[3, 8, 36, 3]`.
-- Stochastic depth uses linear survival schedule:
-  `p_l = 1 - (l / L) * (1 - p_last)`, with default `p_last=0.5`.
-- During training, each block is dropped with Bernoulli sampling.
-- During eval, residual output is expectation-scaled by `p_l`.
-- Tail truncation is implemented by `set_active_block_count`.
 
 ## Thanks
 
